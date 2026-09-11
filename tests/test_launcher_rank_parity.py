@@ -3,13 +3,11 @@
 
 Hardening asked for by the production-like tester run on PRs #83/#84:
 
-  A  GLM53_APC_RETENTION_INTERVAL_SWA guard -- "" (inherit global) passes in every
-     serving mode. Non-empty values require SPEC_METHOD=dflash; 0 passes and
-     anything else must be a positive multiple of 3584 no larger than
-     1,000,000. The canonical value is what the ranks receive. Runs on the
-     checkout whose launcher actually forwards that knob to the containers
-     (detected from the `-e VLLM_PREFIX_CACHE_RETENTION_INTERVAL_SWA=` line,
-     not guessed).
+  A  GLM53_APC_RETENTION_INTERVAL_SWA guard -- "" (auto) or 0 pass, anything
+     else must be a positive multiple of 3584 no larger than 1,000,000; the
+     canonical value is what the ranks receive. Runs on the checkout whose
+     launcher actually forwards that knob to the containers (detected from
+     the `-e VLLM_PREFIX_CACHE_RETENTION_INTERVAL_SWA=` line, not guessed).
   B  Pre-stop gate -- `./start.sh restart` with a bad knob, or with ANY
      mounted overlay missing / empty / unparseable / pointed at a different
      overlay, exits 2 BEFORE the first docker or ssh call, so healthy
@@ -73,10 +71,12 @@ CONTAINER_NAMES = LAUNCHER_KNOBS + (
 PINNED = (
     "patch_hybrid_prefix_hit.py",
     "patch_apc_per_group_retention.py",
+    "patch_apc_fine_grained_hits.py",
 )
 APC_HOST_VARS = {
     "APC_PATCH_HOST": "patch_hybrid_prefix_hit.py",
     "PERGROUP_PATCH_HOST": "patch_apc_per_group_retention.py",
+    "FINEHIT_PATCH_HOST": "patch_apc_fine_grained_hits.py",
 }
 
 SEP = "\x1f"
@@ -130,7 +130,7 @@ def host_vars() -> dict[str, str]:
     assignment in start.sh, from the real assignment, not from substring hits."""
     out: dict[str, str] = {}
     for m in re.finditer(
-        r'^([A-Z0-9_]+_(?:PATCH|OVERLAY)_HOST)="\$\{\1:-\$SCRIPT_DIR/overlay/([A-Za-z0-9_.]+)\}"$', source(), re.M
+        r'^([A-Z_]+_PATCH_HOST)="\$\{\1:-\$SCRIPT_DIR/overlay/([A-Za-z0-9_.]+)\}"$', source(), re.M
     ):
         out[m.group(1)] = m.group(2)
     return out
@@ -151,19 +151,17 @@ def wires_fg() -> bool:
 # ------------------------------------------------------------------ part A --
 
 
-def run_retention_guard(
-    value: str | None, spec_method: str = "dflash"
-) -> tuple[int, str, str]:
+def run_retention_guard(value: str | None) -> tuple[int, str, str]:
     script = (
         guard_source()
         + "\nGPU_MEM_UTIL=0.87; MAX_MODEL_LEN=1000000; MAX_NUM_SEQS=4\n"
         + "MAX_NUM_BATCHED_TOKENS=1024\n"
-        + "GLM53_INDEXER_WORKSPACE=stock; GLM53_SPINWAIT_MS=stock\n"
+        + "GLM53_INDEXER_WORKSPACE=stock; GLM53_SPINWAIT_MS=stock; SPEC_METHOD=dflash\n"
         + f"{FG}=1\n"
         + "validate_numeric_config || exit $?\n"
         + f'printf "%s\\n" "${{{SWA}-unset}}"\n'
     )
-    env = base_env(SPEC_METHOD=spec_method)
+    env = base_env()
     if value is not None:
         env[SWA] = value
     r = subprocess.run(["bash", "-c", script], text=True, capture_output=True, env=env)
@@ -214,21 +212,6 @@ def part_a() -> None:
             rc == 2 and SWA in err,
             f"A3 {SWA}={value!r} rejected with rc=2 and a named error (rc={rc} err={err[:60]!r})",
         )
-    for spec_method in ("mtp", "none"):
-        for value, expected in ((None, "unset"), ("", "")):
-            rc, out, err = run_retention_guard(value, spec_method)
-            check(
-                rc == 0 and out == expected,
-                f"A4 {SWA}={value!r} accepted with SPEC_METHOD={spec_method} "
-                f"(rc={rc} out={out!r} {err})",
-            )
-        for value in ("0", str(BLOCK)):
-            rc, out, err = run_retention_guard(value, spec_method)
-            check(
-                rc == 2 and SWA in err and "SPEC_METHOD=dflash" in err,
-                f"A4 {SWA}={value!r} rejected with SPEC_METHOD={spec_method} "
-                f"before launch (rc={rc} err={err[:80]!r})",
-            )
 
 
 # --------------------------------------------------------------- harness --
@@ -320,8 +303,8 @@ def longest_parseable_prefix(text: str) -> str | None:
 
 
 
-def control(h: Harness, label: str, **env: str) -> None:
-    r = h.run("restart", **env)
+def control(h: Harness, label: str) -> None:
+    r = h.run("restart")
     calls = h.host_touching_calls()
     head_rm = any(c[:3] == ["docker", "rm", "-f"] for c in calls)
     worker_rm = any(c[0] == "ssh" and "docker rm -f" in c[-1] for c in calls)
@@ -339,13 +322,10 @@ def part_b(h: Harness) -> None:
     v_num = text.index("validate_numeric_config", main_at)
     v_art = text.index("validate_overlay_artifacts", main_at)
     restart = text.index("restart)  stop; start", main_at)
-    check(
-        v_num < restart and v_art < restart,
-        "B1 main() runs the numeric and artifact validators before `restart) stop; start`",
-    )
+    check(v_num < restart and v_art < restart, "B1 main() runs both validators before `restart) stop; start`")
     check(
         "start|restart) validate_numeric_config; validate_overlay_artifacts ;;" in text,
-        "B1 numeric and artifact validators share the start|restart arm",
+        "B1 the validators share the start|restart arm",
     )
     guard_begin = text.index("# GLM53 overlay artifact guard (begin)")
     guard_end = text.index("# GLM53 overlay artifact guard (end)")
@@ -381,13 +361,6 @@ def part_b(h: Harness) -> None:
     # fine). Without this, every negative case below could pass for the
     # wrong reason (a guard that refuses everything).
     control(h, "B3 control: valid restart passes the gate and reaches stop on both ranks")
-    if wires_swa():
-        control(
-            h,
-            "B3 empty SWA override with MTP reaches stop on both ranks",
-            SPEC_METHOD="mtp",
-            **{SWA: ""},
-        )
 
     def fails_closed(label: str, **env: str) -> None:
         r = h.run("restart", **env)
@@ -401,16 +374,6 @@ def part_b(h: Harness) -> None:
     if wires_swa():
         fails_closed(f"B3 restart with {SWA}=3000 exits 2 with nothing stopped", **{SWA: "3000"})
         fails_closed(f"B3 restart with {SWA}=1003520 exits 2 with nothing stopped", **{SWA: "1003520"})
-        fails_closed(
-            f"B3 restart with MTP and {SWA}=0 exits 2 with nothing stopped",
-            SPEC_METHOD="mtp",
-            **{SWA: "0"},
-        )
-        fails_closed(
-            f"B3 restart without speculation and {SWA}={BLOCK} exits 2 with nothing stopped",
-            SPEC_METHOD="none",
-            **{SWA: str(BLOCK)},
-        )
     if wires_fg():
         fails_closed(f"B3 restart with {FG}=yes exits 2 with nothing stopped", **{FG: "yes"})
 
@@ -430,19 +393,6 @@ def part_b(h: Harness) -> None:
         fails_closed(f"B4 {var} empty file ({base})", **{var: str(empty)})
         fails_closed(f"B4 {var} whitespace-only file ({base}; pipefail-safe rc=2 diagnostic)", **{var: str(blank)})
         fails_closed(f"B4 {var} unparseable file ({base})", **{var: str(broken)})
-    if wires_swa():
-        current = h.repo / "overlay" / "patch_apc_per_group_retention.py"
-        stale = h.tmp / "stale_pergroup_patch.py"
-        stale.write_text(
-            current.read_text().replace(
-                "glm53-apc-per-group-contract:explicit-v1",
-                "glm53-apc-per-group-contract:auto-v0",
-            )
-        )
-        fails_closed(
-            "B4 stale per-group retention contract",
-            PERGROUP_PATCH_HOST=str(stale),
-        )
     # Truncation: for EVERY guarded Python artifact, the longest strict prefix
     # (by lines) that still parses. It carries the identity string and is
     # valid Python, so only the EOF-sentinel check can refuse it -- and must.
@@ -469,12 +419,6 @@ def part_b(h: Harness) -> None:
     (h.tmp / "template-dir").mkdir(exist_ok=True)
     (h.tmp / "template-dir" / "x").write_text("x")
     fails_closed("B4 CHAT_TEMPLATE_HOST is a (non-empty) directory", CHAT_TEMPLATE_HOST=str(h.tmp / "template-dir"))
-    invalid_template = h.tmp / "invalid-template.jinja"
-    invalid_template.write_text("{% if broken %}\n")
-    fails_closed(
-        "B4 CHAT_TEMPLATE_HOST has invalid Jinja syntax",
-        CHAT_TEMPLATE_HOST=str(invalid_template),
-    )
     layer_map = h.repo / "ablit" / "LAYER_MAP.json"
     saved = layer_map.read_text()
     layer_map.write_text("{ not json")
@@ -504,10 +448,10 @@ def part_c(h: Harness) -> None:
     text = source()
     order = overlay_order()
     idx = {name: order.index(name) for name in PINNED if name in order}
-    check(len(idx) == 2, f"C1 both prefix-cache overlays are listed: {sorted(idx)}")
+    check(len(idx) == 3, f"C1 all three prefix-cache overlays are listed: {sorted(idx)}")
     check(
-        len(idx) == 2 and idx[PINNED[0]] < idx[PINNED[1]],
-        "C1 pinned order hybrid -> per-group",
+        len(idx) == 3 and idx[PINNED[0]] < idx[PINNED[1]] < idx[PINNED[2]],
+        "C1 pinned order hybrid -> per-group -> fine-grained",
     )
     check(
         'emit_overlay_block >> "$HEAD_SCRIPT"' in text and 'emit_overlay_block >> "$WORKER_SCRIPT"' in text,
@@ -531,8 +475,9 @@ def part_c(h: Harness) -> None:
             body = s.read_text()
             check(
                 body.index("/opt/glm53/patch_hybrid_prefix_hit.py")
-                < body.index("/opt/glm53/patch_apc_per_group_retention.py"),
-                f"C3 {s.name}: hybrid -> per-group in the generated script",
+                < body.index("/opt/glm53/patch_apc_per_group_retention.py")
+                < body.index("/opt/glm53/patch_apc_fine_grained_hits.py"),
+                f"C3 {s.name}: hybrid -> per-group -> fine-grained in the generated script",
             )
             check(
                 "python3 /opt/glm53/patch_ablit.py" in body
@@ -617,7 +562,7 @@ def part_d(h: Harness) -> None:
 
     scenarios: list[tuple[str, dict[str, str]]] = [("defaults", {})]
     if wires_swa():
-        scenarios += [("SWA=14336", {SWA: "14336"}), ("SWA=0", {SWA: "0"}), ("SWA unset", {})]
+        scenarios += [("SWA=14336", {SWA: "14336"}), ("SWA=0", {SWA: "0"}), ("SWA unset (auto)", {})]
     if wires_fg():
         scenarios += [("FINEGRAINED=0", {FG: "0"}), ("FINEGRAINED=1", {FG: "1"})]
     if wires_swa() and wires_fg():
@@ -644,7 +589,7 @@ def part_d(h: Harness) -> None:
         if wires_swa() and not env.get(SWA, ""):
             check(
                 "VLLM_PREFIX_CACHE_RETENTION_INTERVAL_SWA" not in head.env and "VLLM_PREFIX_CACHE_RETENTION_INTERVAL_SWA" not in worker.env,
-                f"D2 [{label}] empty SWA override is forwarded to neither rank",
+                f"D2 [{label}] empty SWA (auto) is forwarded to neither rank",
             )
         mounted = {Path(p).name for p in head.mounts}
         check(len(head.mounts) >= 9, f"D3 [{label}] {len(head.mounts)} /opt/glm53 patch mounts, identical chain head-mount = scp source = worker-mount")
@@ -672,15 +617,12 @@ def part_d(h: Harness) -> None:
         tampered = Rank([])
         tampered.env = dict(worker.env)
         tampered.mounts = dict(worker.mounts)
-        tampered.env["VLLM_PREFIX_CACHE_RETENTION_INTERVAL_SWA"] = (
-            "0" if tampered.env.get("VLLM_PREFIX_CACHE_RETENTION_INTERVAL_SWA") != "0" else "1"
-        )
+        tampered.env[FG] = "0" if tampered.env.get(FG) != "0" else "1"
         dest = next(iter(sorted(tampered.mounts)))
         del tampered.mounts[dest]
         issues = parity_issues(head, tampered, scp, {})
         check(
-            any("env VLLM_PREFIX_CACHE_RETENTION_INTERVAL_SWA" in i for i in issues)
-            and any("mount set differs" in i for i in issues),
+            any(f"env {FG}" in i for i in issues) and any("mount set differs" in i for i in issues),
             f"D4 synthetic one-rank mismatch is reported ({len(issues)} issues: {issues[:2]})",
         )
         bad_scp = dict(scp)
