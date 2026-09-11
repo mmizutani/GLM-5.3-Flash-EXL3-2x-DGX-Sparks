@@ -59,8 +59,8 @@ if [ ! -f "$SCRIPT_DIR/.env" ]; then
 fi
 # Caller exports, including explicit empties, must win over .env.
 # Snapshot exports rather than parsing .env: it is sourced as shell code.
-# The fine-grained-APC kill switch additionally keeps the setness-aware pair
-# below because the numeric guard must see an explicitly empty caller value.
+# Setness-aware pair for the fine-grained kill switch: an explicitly empty
+# caller value must reach the guard, not silently lose to a .env value.
 _cli_finegrained_set="${GLM53_FINEGRAINED_APC+1}"
 _cli_finegrained="${GLM53_FINEGRAINED_APC-}"
 _caller_overrides=()
@@ -263,7 +263,7 @@ GLM53_SUPPRESS_STOPS_IN_REASONING="${GLM53_SUPPRESS_STOPS_IN_REASONING:-1}"
 # skip = do not mix; N>0 = cap tokens; 0 = off.
 GLM53_MIXED_PREFILL_CHUNK="${GLM53_MIXED_PREFILL_CHUNK:-skip}"
 # 1 = fine-grained (64-token) prefix-cache hits (overlay patch_apc_fine_grained_hits.py);
-# 0 = upstream 3584-block hits. Default applies only when UNSET: an explicitly
+# 0 = upstream 3584-block hits. Default applies only when UNSET; an explicitly
 # empty value is an operator error and validate_numeric_config rejects it.
 GLM53_FINEGRAINED_APC="${GLM53_FINEGRAINED_APC-1}"
 # Adaptive verification length (overlay/patch_adaptive_k.py). off = stock k=7 every step.
@@ -289,20 +289,6 @@ GLM53_INDEXER_WORKSPACE="${GLM53_INDEXER_WORKSPACE-rightsize}"
 # SpinCondition reader busy-loop window. "stock" preserves vLLM's 1 s default;
 # 1..1000 selects milliseconds. The frozen TP=2 sweep selected 16 ms.
 GLM53_SPINWAIT_MS="${GLM53_SPINWAIT_MS-stock}"
-# vLLM hybrid prefix-cache retention for SWA/Mamba checkpoint groups.
-# Empty = vLLM default (dense checkpoints). 0 = keep only the latest replay
-# boundary; N = one tail checkpoint per N scheduler-block tokens (a multiple
-# of the scheduler block). Forwarded verbatim; unset stays unset.
-VLLM_PREFIX_CACHE_RETENTION_INTERVAL="${VLLM_PREFIX_CACHE_RETENTION_INTERVAL:-}"
-if [ -z "$VLLM_PREFIX_CACHE_RETENTION_INTERVAL" ]; then
-    unset VLLM_PREFIX_CACHE_RETENTION_INTERVAL
-fi
-# Per-group APC retention (overlay/patch_apc_per_group_retention.py). The
-# EAGLE-exempt DFlash2 drafter group otherwise spends 33 of the 38 block ids a
-# cached 3584-token segment costs, evicting the MLA/mamba blocks that carry the
-# hit (PR #83). Empty/unset = auto (reachable boundaries only), 0 = boundaries
-# only, N = multiple of the 3584-token scheduler block, <= 1000000.
-GLM53_APC_RETENTION_INTERVAL_SWA="${GLM53_APC_RETENTION_INTERVAL_SWA-}"
 # EngineCore stock timeout is 300s; mid-serve Triton/TileLang JIT on TP=2 can
 # exceed that without being a true hang. NCCL watchdog is still 600s.
 VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS="${VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS:-1800}"
@@ -367,51 +353,15 @@ _glm53_canonical_positive_int() {
     export "$name"
 }
 
-# Enum knobs are exactly one of a fixed set. Not "non-empty means on": a
-# typo'd knob must not silently pick a serving mode. GLM53_INDEXER_WORKSPACE
-# sizes the sparse-indexer prefill workspace, and the patched
-# get_max_prefill_buffer_size itself raises on anything but stock/rightsize
-# (overlay/patch_indexer_workspace.py, _glm53_workspace_mode), so catching it
-# here turns a container boot failure into a launcher error. The match is
-# literal on both sides -- the "-stock" default applies only to an UNSET var,
-# so "", " rightsize " and "RIGHTSIZE" all fail here and would fail there.
-_glm53_validate_enum() {
-    local name="$1" value="$2" allowed
-    shift 2
-    for allowed in "$@"; do
-        [ "$value" = "$allowed" ] && return 0
-    done
-    echo "$name must be one of: $* (got: $value)" >&2
-    return 2
-}
-
-# Kill switches are exactly 0 or 1; the coordinator refuses anything else at
-# init (overlay/patch_apc_fine_grained_hits.py), so catch it pre-stop here.
-_glm53_validate_bool_flag() {
-    local name="$1" value="$2"
-    if [ "$value" != 0 ] && [ "$value" != 1 ]; then
-        echo "$name must be exactly 0 or 1 (got: $value)" >&2
-        return 2
-    fi
-}
-
-_glm53_validate_spinwait_ms() {
-    # UNSET is stock; an explicit empty value still fails the canonical-int
-    # check (the config section applies the same `-stock` default, so this
-    # only matters for the standalone guard block test).
-    GLM53_SPINWAIT_MS="${GLM53_SPINWAIT_MS-stock}"
-    if [ "$GLM53_SPINWAIT_MS" = "stock" ]; then
-        export GLM53_SPINWAIT_MS
-        return 0
-    fi
-    _glm53_canonical_positive_int \
-        GLM53_SPINWAIT_MS "$GLM53_SPINWAIT_MS" 1000
-}
-
-# Per-group retention is a token count on the 3584-token scheduler-block grid.
-# Empty (auto) and 0 pass as-is; anything else must be a positive multiple.
-# overlay/patch_apc_per_group_retention.py re-checks this at coordinator init
-# against the live scheduler_block_size, so a typo fails here first.
+# Prefix-cache retention intervals are token counts on the scheduler-block
+# grid. "" (unset = inherit the global policy) and 0 pass as-is; anything
+# else must be a positive multiple of GLM53_APC_BLOCK_TOKENS no larger than
+# GLM53_APC_RETENTION_MAX -- the same rule overlay/patch_apc_per_group_retention.py
+# re-checks at coordinator init against the live scheduler_block_size. main()
+# runs this guard before `restart` stops anything, so a typo is a launcher
+# error with the healthy pair still serving, not a boot failure after the old
+# containers are already gone. The canonical value (leading zeros stripped) is
+# what both ranks receive.
 GLM53_APC_BLOCK_TOKENS=3584
 GLM53_APC_RETENTION_MAX=1000000
 _glm53_validate_retention_interval() {
@@ -436,6 +386,46 @@ _glm53_validate_retention_interval() {
     export "$name"
 }
 
+# Enum knobs are exactly one of a fixed set. Not "non-empty means on": a
+# typo'd knob must not silently pick a serving mode. GLM53_INDEXER_WORKSPACE
+# sizes the sparse-indexer prefill workspace, and the patched
+# get_max_prefill_buffer_size itself raises on anything but stock/rightsize
+# (overlay/patch_indexer_workspace.py, _glm53_workspace_mode), so catching it
+# here turns a container boot failure into a launcher error. The match is
+# literal on both sides -- the "-stock" default applies only to an UNSET var,
+# so "", " rightsize " and "RIGHTSIZE" all fail here and would fail there.
+_glm53_validate_enum() {
+    local name="$1" value="$2" allowed
+    shift 2
+    for allowed in "$@"; do
+        [ "$value" = "$allowed" ] && return 0
+    done
+    echo "$name must be one of: $* (got: $value)" >&2
+    return 2
+}
+
+_glm53_validate_spinwait_ms() {
+    # UNSET is stock; an explicitly empty value still fails the canonical-int
+    # check (mirrors the config section's `-stock` default).
+    GLM53_SPINWAIT_MS="${GLM53_SPINWAIT_MS-stock}"
+    if [ "$GLM53_SPINWAIT_MS" = "stock" ]; then
+        export GLM53_SPINWAIT_MS
+        return 0
+    fi
+    _glm53_canonical_positive_int \
+        GLM53_SPINWAIT_MS "$GLM53_SPINWAIT_MS" 1000
+}
+
+# Kill switches are exactly 0 or 1; the coordinator refuses anything else at
+# init (overlay/patch_apc_fine_grained_hits.py), so catch it pre-stop here.
+_glm53_validate_bool_flag() {
+    local name="$1" value="$2"
+    if [ "$value" != 0 ] && [ "$value" != 1 ]; then
+        echo "$name must be exactly 0 or 1 (got: $value)" >&2
+        return 2
+    fi
+}
+
 validate_numeric_config() {
     if ! [[ "$GPU_MEM_UTIL" =~ ^(0([.][0-9]+)?|[.][0-9]+|1([.]0+)?)$ ]] \
        || ! awk -v u="$GPU_MEM_UTIL" 'BEGIN { exit !(u > 0 && u <= 1) }'; then
@@ -452,13 +442,18 @@ validate_numeric_config() {
     _glm53_validate_enum GLM53_INDEXER_WORKSPACE "${GLM53_INDEXER_WORKSPACE-rightsize}" \
         stock rightsize || return
     _glm53_validate_spinwait_ms || return
-    _glm53_validate_retention_interval GLM53_APC_RETENTION_INTERVAL_SWA "${GLM53_APC_RETENTION_INTERVAL_SWA-}" || return
-    _glm53_validate_bool_flag GLM53_FINEGRAINED_APC "${GLM53_FINEGRAINED_APC-1}" || return
     # The template treats medium as max, so do not advertise it as a level.
     if [ -n "${GLM53_DEFAULT_REASONING_EFFORT-}" ]; then
         _glm53_validate_enum GLM53_DEFAULT_REASONING_EFFORT \
             "$GLM53_DEFAULT_REASONING_EFFORT" low high max || return
     fi
+    _glm53_validate_retention_interval GLM53_APC_RETENTION_INTERVAL "${GLM53_APC_RETENTION_INTERVAL-}" || return
+    _glm53_validate_retention_interval GLM53_APC_RETENTION_INTERVAL_SWA "${GLM53_APC_RETENTION_INTERVAL_SWA-}" || return
+    if [ -n "${GLM53_APC_RETENTION_INTERVAL_SWA:-}" ] && [ "$SPEC_METHOD" != "dflash" ]; then
+        echo "GLM53_APC_RETENTION_INTERVAL_SWA requires SPEC_METHOD=dflash (got: $SPEC_METHOD)" >&2
+        return 2
+    fi
+    _glm53_validate_bool_flag GLM53_FINEGRAINED_APC "${GLM53_FINEGRAINED_APC-1}" || return
 }
 # GLM53 numeric config guard (end)
 
@@ -475,12 +470,29 @@ validate_numeric_config() {
 # error (wrong path, stale checkout, truncated copy); it is not a
 # tamper-proof manifest. Needs python3 on the head (DGX OS ships it).
 # preflight() re-checks existence later; this is the fail-closed early gate.
+# The chat-template parse below needs jinja2 on the host. The caller's
+# `python3` can be a venv/brew interpreter without it, so probe the caller
+# first, then common system interpreters; GLM53_VALIDATE_PYTHON overrides.
+_glm53_template_python() {
+    local candidate
+    for candidate in "${GLM53_VALIDATE_PYTHON:-}" python3 python3.12 python3.11 /usr/bin/python3; do
+        [ -n "$candidate" ] || continue
+        command -v "$candidate" >/dev/null 2>&1 || continue
+        if "$candidate" -c 'import jinja2' >/dev/null 2>&1; then
+            printf '%s' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
 validate_overlay_artifacts() {
     # Sentinels that contain quotes live in single-quoted locals.
     local main_guard='    sys.exit(main())'
     local video_end='    print("glm53: overlay install ok aligned=True", file=sys.stderr)'
     local ablit_marker='MARKER = "ABLIT-HOOK"'
     local -a artifacts=(
+        "$EXL3_OVERLAY_HOST|class Exl3Config(QuantizationConfig):|        )"
         "$VIDEO_PATCH_HOST|vllm/model_executor/layers/|$video_end"
         "$STOP_PATCH_HOST|[suppress-stops-in-reasoning]|    raise SystemExit(main(sys.argv))"
         "$SCHED_PATCH_HOST|[glm53-decode-floor]|$main_guard"
@@ -492,10 +504,10 @@ validate_overlay_artifacts() {
         "$XGRAMMAR_PATCH_HOST|vllm/v1/structured_output/|$main_guard"
         "$KPOOL_TAIL_PATCH_HOST|[glm53-kpool-tail-slotmap]|$main_guard"
         "$SPINWAIT_PATCH_HOST|device_communicators/shm_broadcast.py|$main_guard"
-        "$SCRIPT_DIR/overlay/patch_ablit.py|$ablit_marker|    main()"
-        "$SCRIPT_DIR/overlay/ablit_runtime.py|o_proj abliteration (ABLIT)|    return report"
         "$ADAPTIVE_K_PATCH_HOST|[glm53-adaptive-k]|$main_guard"
         "$DENSE_FP8_PATCH_HOST|[glm53-dense-fp8]|$main_guard"
+        "$SCRIPT_DIR/overlay/patch_ablit.py|$ablit_marker|    main()"
+        "$SCRIPT_DIR/overlay/ablit_runtime.py|o_proj abliteration (ABLIT)|    return report"
     )
     local entry path rest tag tail last
     if [ "${#artifacts[@]}" -eq 0 ]; then
@@ -537,6 +549,15 @@ validate_overlay_artifacts() {
     # layer map (the .pt payloads are ABLIT's own concern at hook time).
     if [ ! -f "$CHAT_TEMPLATE_HOST" ] || [ ! -r "$CHAT_TEMPLATE_HOST" ] || [ ! -s "$CHAT_TEMPLATE_HOST" ]; then
         echo "chat template missing, unreadable, empty or not a regular file: $CHAT_TEMPLATE_HOST" >&2
+        return 2
+    fi
+    local template_python
+    if ! template_python="$(_glm53_template_python)"; then
+        echo "no host python3 with jinja2 found (chat-template validation; set GLM53_VALIDATE_PYTHON)" >&2
+        return 2
+    fi
+    if ! "$template_python" -c 'from jinja2 import Environment; import sys; Environment(extensions=["jinja2.ext.loopcontrols"]).parse(open(sys.argv[1], encoding="utf-8").read())' "$CHAT_TEMPLATE_HOST" 2>/dev/null; then
+        echo "chat template is invalid: $CHAT_TEMPLATE_HOST" >&2
         return 2
     fi
     if ! python3 -c 'import json, sys; json.load(open(sys.argv[1], encoding="utf-8"))' "$SCRIPT_DIR/ablit/LAYER_MAP.json" 2>/dev/null; then
@@ -1137,11 +1158,8 @@ sync_weights() {
 }
 
 # ------------------------ inner container scripts --------------------------
-# Overlay application order inside BOTH rank containers. write_inner_scripts
-# emits this one list verbatim into the head and the worker inner script, so
-# the two ranks cannot drift apart. Pinned for the prefix-cache overlays,
-# which share the kv_cache_coordinator.py helper insert point:
-#   patch_hybrid_prefix_hit -> patch_apc_per_group_retention -> patch_apc_fine_grained_hits
+# Both ranks apply the same checked overlays. Hybrid replay precedes retention
+# because they share the coordinator helper insertion point.
 GLM53_OVERLAY_ORDER=(
     patch_glm_video_placeholders.py
     patch_suppress_stops_in_reasoning.py
@@ -1395,14 +1413,20 @@ launch_cluster() {
         -e VLLM_NO_USAGE_STATS=1
         -e DO_NOT_TRACK=1
         -e "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=$CG_ESTIMATE"
-        -e VLLM_PREFIX_CACHE_RETENTION_INTERVAL
         -e "GLM53_FINEGRAINED_APC=$GLM53_FINEGRAINED_APC"
     )
-    # Per-group APC retention for the EAGLE-exempt DFlash2 drafter SWA group
-    # (overlay/patch_apc_per_group_retention.py). Empty = auto (reachable
-    # boundaries only), 0 = boundaries only, N = multiple of the scheduler block.
+    # Global sparse retention is implemented by the pinned vLLM runtime.  Full
+    # attention remains dense; Mamba managers use this value.  Keep this an
+    # explicit deployer setting and forward it identically to both ranks.
+    if [ -n "${GLM53_APC_RETENTION_INTERVAL:-}" ]; then
+        nccl_common+=(-e "VLLM_PREFIX_CACHE_RETENTION_INTERVAL=$GLM53_APC_RETENTION_INTERVAL")
+        log "global prefix-cache retention interval: ${GLM53_APC_RETENTION_INTERVAL} (both ranks)"
+    fi
+    # Per-group APC retention for the DFlash2 drafter SWA group (overlay patch_apc_per_group_retention.py).
+    # "" = inherit global, 0 = boundaries only, N = multiple of the scheduler block.
     if [ -n "${GLM53_APC_RETENTION_INTERVAL_SWA:-}" ]; then
         nccl_common+=(-e "VLLM_PREFIX_CACHE_RETENTION_INTERVAL_SWA=$GLM53_APC_RETENTION_INTERVAL_SWA")
+        log "drafter (SWA) prefix-cache retention interval: ${GLM53_APC_RETENTION_INTERVAL_SWA} (both ranks)"
     fi
     local worker_nccl="" e
     for e in "${nccl_common[@]}"; do
@@ -1533,7 +1557,6 @@ launch_cluster() {
         -e SKIP_MM_PROFILING="$SKIP_MM_PROFILING" \
         -e LIMIT_MM="$LIMIT_MM" \
         -e CHAT_TEMPLATE="$CHAT_TEMPLATE" \
-        -e VLLM_PREFIX_CACHE_RETENTION_INTERVAL \
         -e ENFORCE_EAGER="$ENFORCE_EAGER" \
         -e EXL3_FUSED_MOE="$EXL3_FUSED_MOE" \
         -e EXL3_MOE_ROW_TILE="$EXL3_MOE_ROW_TILE" \

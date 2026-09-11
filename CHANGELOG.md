@@ -1,5 +1,29 @@
 # Changelog
 
+## 2026-09-11 (merge) — rebase onto origin (PR #130) with a measured conflict resolution
+
+Merged `origin/main` (`9348755`, "per-KV-cache-group APC retention with DFlash
+SWA replay") into the headroom branch. Upstream's launcher machinery is adopted
+as-is (artifact gate, `GLM53_OVERLAY_ORDER`, retention knobs, tests, docs), but
+the reworked retention/hybrid overlays measured **worse** on this kit's agent
+probe than the #83 implementations this branch had already validated:
+3×30 k repeats 0.000 vs 1.000 hits, 2×60 k 0.955 vs 0.999
+(`docs/headroom-2026-09-11.md` §12.3, boots B4–B6; upstream itself frames #130
+as a draft, measured on 128 k append/edit/branch rather than repeat growth).
+The branch therefore keeps `overlay/patch_apc_per_group_retention.py` and
+`overlay/patch_hybrid_prefix_hit.py` at the #83 semantics, plus:
+
+- `overlay/patch_apc_fine_grained_hits.py` (`GLM53_FINEGRAINED_APC=1`, 64-token hits)
+- `overlay/patch_dflash_block_drop.py` (vLLM #54163 cherry-pick)
+- adaptive-k default + auto union capture list, spinwait 16
+- dual-HCA GID preflight; portable jinja2 host check for the new
+  chat-template validation (linuxbrew `python3` lacks jinja2, system python has it)
+
+All 12 host suites pass, and B7 re-validated the restored stack live on the
+merged launcher: 1×/3×/4× 30 k repeats 1.000 at 0.3–0.4 s (vs 0.000 for the
+reworked overlays), 2×60 k 0.999, 3×5 k 0.992, 4-agent × 60 k turns 1–3
+0.886–0.928 (wall 17.7–23.6 s; B3: 0.916–0.928).
+
 ## 2026-09-11 (later) — Prefix-cache cliff FIXED: adopted PR #83/#84 + vLLM #54163
 
 The 8.7 % production hit rate from the morning investigation is fixed by adopting
