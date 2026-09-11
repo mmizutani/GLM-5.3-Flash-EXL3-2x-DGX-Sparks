@@ -1,5 +1,72 @@
 # Changelog
 
+## 2026-09-11 (later) — Prefix-cache cliff FIXED: adopted PR #83/#84 + vLLM #54163
+
+The 8.7 % production hit rate from the morning investigation is fixed by adopting
+the repo's P1 prefix-cache PRs and cherry-picking the matching upstream fix:
+
+- **PR #83** `overlay/patch_apc_per_group_retention.py` + `GLM53_APC_RETENTION_INTERVAL_SWA`
+  (default auto): per-KV-group retention. The EAGLE-exempt DFlash2 drafter keeps only
+  reachable-boundary snapshots instead of 33 of the 38 block ids a cached 3584-token
+  segment costs, so it stops evicting the MLA/mamba blocks that carry the hit.
+- **PR #84** `overlay/patch_apc_fine_grained_hits.py` + `GLM53_FINEGRAINED_APC=1`
+  (default): excludes the KpoolTail scratch from the fine-grained veto, restoring
+  64-token hit alignment (was forced to the 3584-token page; warm agent turns
+  recomputed up to 3583 tokens).
+- **vLLM #54163 cherry-pick** `overlay/patch_dflash_block_drop.py`: `use_eagle()`
+  includes `dflash`, so the scheduler took the EAGLE trailing-block back-off that
+  DFlash never pollutes; the Mamba state never materialized at a block boundary and
+  every reply recomputed the context (upstream #53477/#54094/#45238).
+- Launcher hardening from the PRs: `validate_overlay_artifacts` fail-closed gate
+  before `restart` stops anything, `GLM53_OVERLAY_ORDER` emitted identically to both
+  ranks, `GLM53_FINEGRAINED_APC` 0/1 and `GLM53_APC_RETENTION_INTERVAL_SWA` grid
+  validation. Host tests all pass.
+
+**Live A/B on boot B3** (same probes as the morning run, `.env` as now shipped:
+adaptive-k `ema`, spinwait 16, dense FP8, both new knobs defaulted):
+
+| Probe | before | after |
+|---|---|---|
+| N=3 × 30 k repeat | 17.2 s each, 0.000 hits | **0.4 s each, 1.000** |
+| N=4 × 30 k repeat | 17.2 s each, 0.000 | **0.4 s each, 1.000** |
+| 2 × 60 k repeat | 34–35 s, 0.000 | **0.4 s, 0.999** |
+| 4-agent × 60 k turns 1–3 | 0.000, wall 150–196 s | **0.916–0.928, wall 17.7–18.9 s** |
+| hash-map prose | 34.43 tok/s | 34.50 (no regression), coherence pass |
+
+Details and receipts: `docs/headroom-2026-09-11.md` §12,
+`logs/headroom-20260911/B3-*`. Open upstream items: **#54076** (mamba block-grid
+chunk split) and **#55601** (state-seed units) — neither blocks this fix.
+
+## 2026-09-11 — adaptive-k default ON, spinwait 16, long-prefill warmup; prefix-cache cliff found
+
+Live re-measure on this 2× GB10 kit (three clean boots B0/B1/B2), full write-up
+`docs/headroom-2026-09-11.md`, raw receipts `logs/headroom-20260911/`:
+
+- **`GLM53_ADAPTIVE_K=ema` is now the `.env.example` default.** A/B/A (union captures, MNBT 7168,
+  spinwait 2): hash-map prose 29.36 vs 26.63 tok/s (**+10.3 %**), structured 65.95 vs 65.91
+  (neutral). `start.sh` now auto-adds the required capture list `1 2 3 4 5 6 8 9 10 12 15 16 20 24 32`
+  when the knob is `ema/on/1`; previously stock `1 2 4 8 16 24 32` silently missed the 3- and
+  5-token graph shapes. The union list costs ~51 k KV tokens (984,210 → 933,082 at 0.85).
+- **`GLM53_SPINWAIT_MS=16`** in `.env.example` (was `stock`). Re-checked at MNBT 7168: no
+  regression (prose 30.44 tok/s), consistent with the frozen 2048 sweep (+0.95 %, −85 % CPU).
+- **Dense FP8 stays opt-in** but is now fully measured: stacked vs stock k=7 + BF16 dense,
+  structured 65.9 → 75.0 tok/s, prose 26.6 → 34.4; KLD 0.002–0.016 nats / argmax 97.0–99.7 %
+  on four fixed texts (one repetitive-prose text above the old 0.013 proxy bar).
+- **Boot warmup gap fixed** (`scripts/boot-shape-warmup.sh`): the only mid-serve JIT in the prior
+  5 h serve was `BuildPrefillChunkMetadataKernel`; added `PREFILL_S=(3584 7168 14336 65536)`,
+  staged long payloads through a file (ARG_MAX), and ignored payload files in the outcome tally.
+- **Prefix-cache cliff diagnosed**: the live 8.7 % hit rate is server-side. Replaying the exact
+  deep-swe agent payloads hits on an idle engine where the live run missed; a sequential probe
+  shows 1–2 long sessions retain prefixes (~96–100 %) and 3+ lose everything, independent of the
+  918 k-token pool, adaptive-k, and `VLLM_PREFIX_CACHE_RETENTION_INTERVAL=3584` (knob plumbed
+  through `start.sh`, left unset). Recommended mitigation: keep simultaneously cached long
+  sessions ≤ 2.
+- **Dual-rail CX7 verified**: single HCA 12.84 GB/s vs dual 20.94 GB/s peak all-reduce busbw;
+  `NCCL_CROSS_NIC=1` / `NCCL_IB_MERGE_NICS=1` gave no further gain.
+- Host DRAM is at the ceiling (2 GiB MemAvailable under concurrent 40 k prefills even with the
+  agent sandboxes stopped): do not raise `GPU_MEM_UTIL`. New probes: `tests/bench_agent_sessions.py`,
+  `tests/replay_responses_traj.py`, `tests/bench_logprobs.py`.
+
 ## 2026-09-07 — E3 grouped fat-expert MoE prefill (`EXL3_FAT_GROUPED`, now the default)
 
 Cold prefill **+37–45%** on this 2× GB10 kit (16k: 1,155 → 1,578 tok/s; 128k: ~1,150 → 1,629; 256k: 1,087 → 1,576),

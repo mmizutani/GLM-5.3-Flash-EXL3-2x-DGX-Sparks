@@ -59,6 +59,10 @@ if [ ! -f "$SCRIPT_DIR/.env" ]; then
 fi
 # Caller exports, including explicit empties, must win over .env.
 # Snapshot exports rather than parsing .env: it is sourced as shell code.
+# The fine-grained-APC kill switch additionally keeps the setness-aware pair
+# below because the numeric guard must see an explicitly empty caller value.
+_cli_finegrained_set="${GLM53_FINEGRAINED_APC+1}"
+_cli_finegrained="${GLM53_FINEGRAINED_APC-}"
 _caller_overrides=()
 while IFS= read -r _k; do
     _flags="$(declare -p "$_k")"
@@ -73,7 +77,8 @@ set +a
 # Each entry is NAME=value; quoting preserves whitespace and empty values.
 # shellcheck disable=SC2163
 for _kv in ${_caller_overrides[@]+"${_caller_overrides[@]}"}; do export "$_kv"; done
-unset _k _kv _flags _caller_overrides
+[ -n "${_cli_finegrained_set}" ] && GLM53_FINEGRAINED_APC="$_cli_finegrained"
+unset _k _kv _flags _caller_overrides _cli_finegrained_set _cli_finegrained
 
 # ----------------------------- configuration -------------------------------
 MODEL="${MODEL:-Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw}"
@@ -164,6 +169,9 @@ STOP_PATCH_HOST="${STOP_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_suppress_stops_in_
 SCHED_PATCH_HOST="${SCHED_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_scheduler_decode_floor.py}"
 DRAFTER_PATCH_HOST="${DRAFTER_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_glm5_drafter_group.py}"
 APC_PATCH_HOST="${APC_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_hybrid_prefix_hit.py}"
+PERGROUP_PATCH_HOST="${PERGROUP_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_apc_per_group_retention.py}"
+FINEHIT_PATCH_HOST="${FINEHIT_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_apc_fine_grained_hits.py}"
+DFLASH_DROP_PATCH_HOST="${DFLASH_DROP_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_dflash_block_drop.py}"
 XGRAMMAR_PATCH_HOST="${XGRAMMAR_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_xgrammar_termination.py}"
 KPOOL_TAIL_PATCH_HOST="${KPOOL_TAIL_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_kpool_tail_slotmap.py}"
 SPINWAIT_PATCH_HOST="${SPINWAIT_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_spinwait.py}"
@@ -189,7 +197,20 @@ if [ "${ENFORCE_EAGER}" != "1" ]; then
         *" --cudagraph-capture-sizes "*|*" cudagraph-capture-sizes "*) ;;
         *)
             if [ "$SPEC_METHOD" = "dflash" ]; then
-                EXTRA_ARGS="${EXTRA_ARGS:+$EXTRA_ARGS }--cudagraph-capture-sizes 1 2 4 8 16 24 32"
+                # Adaptive-k verifies 2/4/7 drafts -> query lens {3,5,8}; the
+                # graph batch is num_seqs x query_len up to 4x8. The stock list
+                # misses 3 and 5, so adaptive-k would silently fall back to
+                # eager shapes for those steps (measured 2026-09-11).
+                _adaptive_k_mode="$(printf '%s' "${GLM53_ADAPTIVE_K:-off}" | tr '[:upper:]' '[:lower:]')"
+                case "$_adaptive_k_mode" in
+                    ema|on|1)
+                        EXTRA_ARGS="${EXTRA_ARGS:+$EXTRA_ARGS }--cudagraph-capture-sizes 1 2 3 4 5 6 8 9 10 12 15 16 20 24 32"
+                        ;;
+                    *)
+                        EXTRA_ARGS="${EXTRA_ARGS:+$EXTRA_ARGS }--cudagraph-capture-sizes 1 2 4 8 16 24 32"
+                        ;;
+                esac
+                unset _adaptive_k_mode
             else
                 EXTRA_ARGS="${EXTRA_ARGS:+$EXTRA_ARGS }--cudagraph-capture-sizes 1 2 3 4 6 8 12"
             fi
@@ -241,6 +262,10 @@ GLM53_SUPPRESS_STOPS_IN_REASONING="${GLM53_SUPPRESS_STOPS_IN_REASONING:-1}"
 # Mixed-step prefill policy when a peer is already decoding (issue #6).
 # skip = do not mix; N>0 = cap tokens; 0 = off.
 GLM53_MIXED_PREFILL_CHUNK="${GLM53_MIXED_PREFILL_CHUNK:-skip}"
+# 1 = fine-grained (64-token) prefix-cache hits (overlay patch_apc_fine_grained_hits.py);
+# 0 = upstream 3584-block hits. Default applies only when UNSET: an explicitly
+# empty value is an operator error and validate_numeric_config rejects it.
+GLM53_FINEGRAINED_APC="${GLM53_FINEGRAINED_APC-1}"
 # Adaptive verification length (overlay/patch_adaptive_k.py). off = stock k=7 every step.
 GLM53_ADAPTIVE_K="${GLM53_ADAPTIVE_K:-off}"
 GLM53_ADAPTIVE_K_SET="${GLM53_ADAPTIVE_K_SET:-2,4,7}"
@@ -264,6 +289,20 @@ GLM53_INDEXER_WORKSPACE="${GLM53_INDEXER_WORKSPACE-rightsize}"
 # SpinCondition reader busy-loop window. "stock" preserves vLLM's 1 s default;
 # 1..1000 selects milliseconds. The frozen TP=2 sweep selected 16 ms.
 GLM53_SPINWAIT_MS="${GLM53_SPINWAIT_MS-stock}"
+# vLLM hybrid prefix-cache retention for SWA/Mamba checkpoint groups.
+# Empty = vLLM default (dense checkpoints). 0 = keep only the latest replay
+# boundary; N = one tail checkpoint per N scheduler-block tokens (a multiple
+# of the scheduler block). Forwarded verbatim; unset stays unset.
+VLLM_PREFIX_CACHE_RETENTION_INTERVAL="${VLLM_PREFIX_CACHE_RETENTION_INTERVAL:-}"
+if [ -z "$VLLM_PREFIX_CACHE_RETENTION_INTERVAL" ]; then
+    unset VLLM_PREFIX_CACHE_RETENTION_INTERVAL
+fi
+# Per-group APC retention (overlay/patch_apc_per_group_retention.py). The
+# EAGLE-exempt DFlash2 drafter group otherwise spends 33 of the 38 block ids a
+# cached 3584-token segment costs, evicting the MLA/mamba blocks that carry the
+# hit (PR #83). Empty/unset = auto (reachable boundaries only), 0 = boundaries
+# only, N = multiple of the 3584-token scheduler block, <= 1000000.
+GLM53_APC_RETENTION_INTERVAL_SWA="${GLM53_APC_RETENTION_INTERVAL_SWA-}"
 # EngineCore stock timeout is 300s; mid-serve Triton/TileLang JIT on TP=2 can
 # exceed that without being a true hang. NCCL watchdog is still 600s.
 VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS="${VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS:-1800}"
@@ -346,13 +385,55 @@ _glm53_validate_enum() {
     return 2
 }
 
+# Kill switches are exactly 0 or 1; the coordinator refuses anything else at
+# init (overlay/patch_apc_fine_grained_hits.py), so catch it pre-stop here.
+_glm53_validate_bool_flag() {
+    local name="$1" value="$2"
+    if [ "$value" != 0 ] && [ "$value" != 1 ]; then
+        echo "$name must be exactly 0 or 1 (got: $value)" >&2
+        return 2
+    fi
+}
+
 _glm53_validate_spinwait_ms() {
+    # UNSET is stock; an explicit empty value still fails the canonical-int
+    # check (the config section applies the same `-stock` default, so this
+    # only matters for the standalone guard block test).
+    GLM53_SPINWAIT_MS="${GLM53_SPINWAIT_MS-stock}"
     if [ "$GLM53_SPINWAIT_MS" = "stock" ]; then
         export GLM53_SPINWAIT_MS
         return 0
     fi
     _glm53_canonical_positive_int \
         GLM53_SPINWAIT_MS "$GLM53_SPINWAIT_MS" 1000
+}
+
+# Per-group retention is a token count on the 3584-token scheduler-block grid.
+# Empty (auto) and 0 pass as-is; anything else must be a positive multiple.
+# overlay/patch_apc_per_group_retention.py re-checks this at coordinator init
+# against the live scheduler_block_size, so a typo fails here first.
+GLM53_APC_BLOCK_TOKENS=3584
+GLM53_APC_RETENTION_MAX=1000000
+_glm53_validate_retention_interval() {
+    local name="$1" value="$2" canonical
+    [ -n "$value" ] || return 0
+    if ! [[ "$value" =~ ^[0-9]+$ ]]; then
+        echo "$name must be empty, 0, or a positive multiple of $GLM53_APC_BLOCK_TOKENS <= $GLM53_APC_RETENTION_MAX (got: $value)" >&2
+        return 2
+    fi
+    canonical="$value"
+    while [ "${canonical#0}" != "$canonical" ]; do canonical="${canonical#0}"; done
+    [ -n "$canonical" ] || canonical=0
+    if [ "$canonical" != 0 ] \
+       && { [ "${#canonical}" -gt "${#GLM53_APC_RETENTION_MAX}" ] \
+            || [ "$canonical" -gt "$GLM53_APC_RETENTION_MAX" ] \
+            || [ $((canonical % GLM53_APC_BLOCK_TOKENS)) -ne 0 ]; }; then
+        echo "$name must be empty, 0, or a positive multiple of $GLM53_APC_BLOCK_TOKENS <= $GLM53_APC_RETENTION_MAX (got: $value)" >&2
+        return 2
+    fi
+    printf -v "$name" '%s' "$canonical"
+    # shellcheck disable=SC2163
+    export "$name"
 }
 
 validate_numeric_config() {
@@ -371,6 +452,8 @@ validate_numeric_config() {
     _glm53_validate_enum GLM53_INDEXER_WORKSPACE "${GLM53_INDEXER_WORKSPACE-rightsize}" \
         stock rightsize || return
     _glm53_validate_spinwait_ms || return
+    _glm53_validate_retention_interval GLM53_APC_RETENTION_INTERVAL_SWA "${GLM53_APC_RETENTION_INTERVAL_SWA-}" || return
+    _glm53_validate_bool_flag GLM53_FINEGRAINED_APC "${GLM53_FINEGRAINED_APC-1}" || return
     # The template treats medium as max, so do not advertise it as a level.
     if [ -n "${GLM53_DEFAULT_REASONING_EFFORT-}" ]; then
         _glm53_validate_enum GLM53_DEFAULT_REASONING_EFFORT \
@@ -378,6 +461,90 @@ validate_numeric_config() {
     fi
 }
 # GLM53 numeric config guard (end)
+
+# GLM53 overlay artifact guard (begin)
+# Every file both rank containers mount. main() runs validate_overlay_artifacts
+# on start|restart BEFORE `restart` stops anything: a missing, empty,
+# mis-pointed, truncated or syntactically broken input is a launcher error
+# with the healthy pair left serving, not a container that dies at boot after
+# the old one is gone. Python overlays: path|identity string|last line -
+# the identity string (MARK / target path / hook marker) is distinct per file
+# so a *_PATCH_HOST pointed at a different overlay is caught, and the last
+# non-blank line must match exactly so a copy truncated anywhere before EOF
+# (even one that still parses) is caught too. This guards against operator
+# error (wrong path, stale checkout, truncated copy); it is not a
+# tamper-proof manifest. Needs python3 on the head (DGX OS ships it).
+# preflight() re-checks existence later; this is the fail-closed early gate.
+validate_overlay_artifacts() {
+    # Sentinels that contain quotes live in single-quoted locals.
+    local main_guard='    sys.exit(main())'
+    local video_end='    print("glm53: overlay install ok aligned=True", file=sys.stderr)'
+    local ablit_marker='MARKER = "ABLIT-HOOK"'
+    local -a artifacts=(
+        "$VIDEO_PATCH_HOST|vllm/model_executor/layers/|$video_end"
+        "$STOP_PATCH_HOST|[suppress-stops-in-reasoning]|    raise SystemExit(main(sys.argv))"
+        "$SCHED_PATCH_HOST|[glm53-decode-floor]|$main_guard"
+        "$DRAFTER_PATCH_HOST|vllm/v1/core/kv_cache_utils.py|$main_guard"
+        "$APC_PATCH_HOST|[glm53-hybrid-apc]|$main_guard"
+        "$PERGROUP_PATCH_HOST|[glm53-apc-per-group]|$main_guard"
+        "$FINEHIT_PATCH_HOST|[glm53-finegrained-apc]|$main_guard"
+        "$DFLASH_DROP_PATCH_HOST|[glm53-dflash-block-drop]|$main_guard"
+        "$XGRAMMAR_PATCH_HOST|vllm/v1/structured_output/|$main_guard"
+        "$KPOOL_TAIL_PATCH_HOST|[glm53-kpool-tail-slotmap]|$main_guard"
+        "$SPINWAIT_PATCH_HOST|device_communicators/shm_broadcast.py|$main_guard"
+        "$SCRIPT_DIR/overlay/patch_ablit.py|$ablit_marker|    main()"
+        "$SCRIPT_DIR/overlay/ablit_runtime.py|o_proj abliteration (ABLIT)|    return report"
+        "$ADAPTIVE_K_PATCH_HOST|[glm53-adaptive-k]|$main_guard"
+        "$DENSE_FP8_PATCH_HOST|[glm53-dense-fp8]|$main_guard"
+    )
+    local entry path rest tag tail last
+    if [ "${#artifacts[@]}" -eq 0 ]; then
+        echo "overlay artifact list is empty - refusing to launch" >&2
+        return 2
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "python3 is required on the head to verify overlay artifacts before launch" >&2
+        return 2
+    fi
+    for entry in "${artifacts[@]}"; do
+        path="${entry%%|*}"
+        rest="${entry#*|}"
+        tag="${rest%%|*}"
+        tail="${rest#*|}"
+        if [ ! -f "$path" ] || [ ! -r "$path" ] || [ ! -s "$path" ]; then
+            echo "overlay artifact missing, unreadable or empty: $path" >&2
+            return 2
+        fi
+        if ! grep -qF -- "$tag" "$path"; then
+            echo "overlay artifact $path does not carry its identity string '$tag' (wrong file?)" >&2
+            return 2
+        fi
+        # `|| true`: under pipefail a whitespace-only file makes grep exit 1,
+        # which must surface as the rc=2 diagnostic below, not a bare exit 1.
+        last="$(grep -v '^[[:space:]]*$' "$path" | tail -n 1 || true)"
+        if [ "$last" != "$tail" ]; then
+            echo "overlay artifact $path does not end with '$tail' (truncated copy? last line: '$last')" >&2
+            return 2
+        fi
+        # Parse-only: proves the file is importable Python without executing it
+        # or leaving __pycache__ litter in the checkout.
+        if ! python3 -c 'import ast, sys; ast.parse(open(sys.argv[1], encoding="utf-8").read(), sys.argv[1])' "$path" 2>/dev/null; then
+            echo "overlay artifact does not parse as Python: $path" >&2
+            return 2
+        fi
+    done
+    # Non-Python inputs both ranks mount: the chat template and the ablit
+    # layer map (the .pt payloads are ABLIT's own concern at hook time).
+    if [ ! -f "$CHAT_TEMPLATE_HOST" ] || [ ! -r "$CHAT_TEMPLATE_HOST" ] || [ ! -s "$CHAT_TEMPLATE_HOST" ]; then
+        echo "chat template missing, unreadable, empty or not a regular file: $CHAT_TEMPLATE_HOST" >&2
+        return 2
+    fi
+    if ! python3 -c 'import json, sys; json.load(open(sys.argv[1], encoding="utf-8"))' "$SCRIPT_DIR/ablit/LAYER_MAP.json" 2>/dev/null; then
+        echo "ablit layer map missing or not JSON: $SCRIPT_DIR/ablit/LAYER_MAP.json" >&2
+        return 2
+    fi
+}
+# GLM53 overlay artifact guard (end)
 
 banner() {
     local label="${1:-start.sh}"
@@ -478,31 +645,26 @@ preflight() {
     worker_ssh "nvidia-smi -L 2>/dev/null | grep -q GB10" \
         || warn "no GB10 GPU visible on worker"
 
-    # Each rank's GID index must name a populated entry on ITS OWN CX7 device.
-    # An empty (all-zero) entry passes every earlier check and then kills that
-    # rank ~60 s in with ibv_modify_qp errno 61 "No data available". The index is
-    # per-NIC, so validate head and worker separately: some pairs share one good
-    # index, others need different ones (HEAD_GID / WORKER_GID).
-    local gid_head gid_worker gid_path
-    gid_path="/sys/class/infiniband/${HEAD_CX7_IB}/ports/1/gids/${HEAD_GID}"
-    gid_head=$(cat "$gid_path" 2>/dev/null | tr -d ':0' || true)
-    gid_path="/sys/class/infiniband/${WORKER_CX7_IB}/ports/1/gids/${WORKER_GID}"
-    gid_worker=$(worker_ssh "cat '$gid_path' 2>/dev/null" | tr -d ':0' || true)
+    # Each rank's GID index must be populated on EVERY selected CX7 device.
+    # Comma-separated device names are passed unchanged to NCCL below.
+    local gid_head=ok gid_worker=ok gid_path hca
+    for hca in ${HEAD_CX7_IB//,/ }; do
+        gid_path="/sys/class/infiniband/${hca}/ports/1/gids/${HEAD_GID}"
+        if [ -z "$(cat "$gid_path" 2>/dev/null | tr -d ':0' || true)" ]; then
+            gid_head=""
+            warn "head GID index ${HEAD_GID} is EMPTY on ${hca}"
+        fi
+    done
+    for hca in ${WORKER_CX7_IB//,/ }; do
+        gid_path="/sys/class/infiniband/${hca}/ports/1/gids/${WORKER_GID}"
+        if [ -z "$(worker_ssh "cat '$gid_path' 2>/dev/null" | tr -d ':0' || true)" ]; then
+            gid_worker=""
+            warn "worker GID index ${WORKER_GID} is EMPTY on ${hca}"
+        fi
+    done
     if [ -z "$gid_head" ] || [ -z "$gid_worker" ]; then
-        if [ -z "$gid_head" ]; then
-            warn "head GID index ${HEAD_GID} is EMPTY on ${HEAD_CX7_IB}"
-        fi
-        if [ -z "$gid_worker" ]; then
-            warn "worker GID index ${WORKER_GID} is EMPTY on ${WORKER_CX7_IB}"
-        fi
-        warn "GID tables — pick each node's ::ffff:<ip> entry whose type is RoCE v2;"
-        warn "the two indices need not match, and a v1 entry at the same index will not work:"
-        for i in 0 1 2 3 4 5 6 7; do
-            printf '    head   gid%s: %-40s %s\n' "$i" \
-                "$(cat "/sys/class/infiniband/${HEAD_CX7_IB}/ports/1/gids/$i" 2>/dev/null)" \
-                "$(cat "/sys/class/infiniband/${HEAD_CX7_IB}/ports/1/gid_attrs/types/$i" 2>/dev/null)" >&2
-        done
-        worker_ssh "for i in 0 1 2 3 4 5 6 7; do printf '    worker gid%s: %-40s %s\n' \"\$i\" \"\$(cat /sys/class/infiniband/${WORKER_CX7_IB}/ports/1/gids/\$i 2>/dev/null)\" \"\$(cat /sys/class/infiniband/${WORKER_CX7_IB}/ports/1/gid_attrs/types/\$i 2>/dev/null)\"; done" >&2 || true
+        warn "Inspect each listed device's /sys/class/infiniband/<device>/ports/1/gids"
+        warn "and gid_attrs/types; select populated RoCE v2 entries on both nodes."
         die "set NCCL_IB_GID_INDEX (same index both ranks) or HEAD_GID/WORKER_GID (per rank) in .env to populated indices"
     fi
 
@@ -524,6 +686,9 @@ preflight() {
     [ -f "$SCHED_PATCH_HOST" ] || die "$SCHED_PATCH_HOST missing"
     [ -f "$DRAFTER_PATCH_HOST" ] || die "$DRAFTER_PATCH_HOST missing"
     [ -f "$APC_PATCH_HOST" ] || die "$APC_PATCH_HOST missing"
+    [ -f "$PERGROUP_PATCH_HOST" ] || die "$PERGROUP_PATCH_HOST missing"
+    [ -f "$FINEHIT_PATCH_HOST" ] || die "$FINEHIT_PATCH_HOST missing"
+    [ -f "$DFLASH_DROP_PATCH_HOST" ] || die "$DFLASH_DROP_PATCH_HOST missing"
     [ -f "$XGRAMMAR_PATCH_HOST" ] || die "$XGRAMMAR_PATCH_HOST missing"
     [ -f "$KPOOL_TAIL_PATCH_HOST" ] || die "$KPOOL_TAIL_PATCH_HOST missing"
     [ -f "$SPINWAIT_PATCH_HOST" ] || die "$SPINWAIT_PATCH_HOST missing"
@@ -972,6 +1137,38 @@ sync_weights() {
 }
 
 # ------------------------ inner container scripts --------------------------
+# Overlay application order inside BOTH rank containers. write_inner_scripts
+# emits this one list verbatim into the head and the worker inner script, so
+# the two ranks cannot drift apart. Pinned for the prefix-cache overlays,
+# which share the kv_cache_coordinator.py helper insert point:
+#   patch_hybrid_prefix_hit -> patch_apc_per_group_retention -> patch_apc_fine_grained_hits
+GLM53_OVERLAY_ORDER=(
+    patch_glm_video_placeholders.py
+    patch_suppress_stops_in_reasoning.py
+    patch_scheduler_decode_floor.py
+    patch_dflash_block_drop.py
+    patch_glm5_drafter_group.py
+    patch_hybrid_prefix_hit.py
+    patch_apc_per_group_retention.py
+    patch_apc_fine_grained_hits.py
+    patch_xgrammar_termination.py
+    patch_kpool_tail_slotmap.py
+    patch_spinwait.py
+    patch_adaptive_k.py
+    patch_dense_fp8.py
+    patch_indexer_workspace.py
+    patch_ablit.py
+)
+
+# Emits the in-container apply block for GLM53_OVERLAY_ORDER (same bytes for
+# both ranks).
+emit_overlay_block() {
+    local p
+    for p in "${GLM53_OVERLAY_ORDER[@]}"; do
+        printf 'if [ -f /opt/glm53/%s ]; then\n    python3 /opt/glm53/%s\nfi\n' "$p" "$p"
+    done
+}
+
 write_inner_scripts() {
     cat > "$HEAD_SCRIPT" <<'EOF'
 #!/bin/bash
@@ -1035,42 +1232,9 @@ if [ -n "${EXTRA_ARGS:-}" ]; then
 fi
 
 [ -f "${MODEL_DIR}/config.json" ] || { say "FATAL: ${MODEL_DIR}/config.json missing"; ls -la "${MODEL_DIR}" | head; exit 1; }
-if [ -f /opt/glm53/patch_glm_video_placeholders.py ]; then
-    python3 /opt/glm53/patch_glm_video_placeholders.py
-fi
-if [ -f /opt/glm53/patch_suppress_stops_in_reasoning.py ]; then
-    python3 /opt/glm53/patch_suppress_stops_in_reasoning.py
-fi
-if [ -f /opt/glm53/patch_scheduler_decode_floor.py ]; then
-    python3 /opt/glm53/patch_scheduler_decode_floor.py
-fi
-if [ -f /opt/glm53/patch_glm5_drafter_group.py ]; then
-    python3 /opt/glm53/patch_glm5_drafter_group.py
-fi
-if [ -f /opt/glm53/patch_hybrid_prefix_hit.py ]; then
-    python3 /opt/glm53/patch_hybrid_prefix_hit.py
-fi
-if [ -f /opt/glm53/patch_xgrammar_termination.py ]; then
-    python3 /opt/glm53/patch_xgrammar_termination.py
-fi
-if [ -f /opt/glm53/patch_kpool_tail_slotmap.py ]; then
-    python3 /opt/glm53/patch_kpool_tail_slotmap.py
-fi
-if [ -f /opt/glm53/patch_spinwait.py ]; then
-    python3 /opt/glm53/patch_spinwait.py
-fi
-if [ -f /opt/glm53/patch_adaptive_k.py ]; then
-    python3 /opt/glm53/patch_adaptive_k.py
-fi
-if [ -f /opt/glm53/patch_dense_fp8.py ]; then
-    python3 /opt/glm53/patch_dense_fp8.py
-fi
-if [ -f /opt/glm53/patch_indexer_workspace.py ]; then
-    python3 /opt/glm53/patch_indexer_workspace.py
-fi
-if [ -f /opt/glm53/patch_ablit.py ]; then
-    python3 /opt/glm53/patch_ablit.py
-fi
+EOF
+    emit_overlay_block >> "$HEAD_SCRIPT"
+    cat >> "$HEAD_SCRIPT" <<'EOF'
 if [ "${ABLIT:-0}" = "1" ]; then
     say "ablit: o_proj orthogonalization ON (method=${ABLIT_METHOD:-auto} direction=${ABLIT_DIRECTION:-dealign} layers=${ABLIT_LAYERS:-15-45} alpha=${ABLIT_ALPHA:-3.0})"
 else
@@ -1141,42 +1305,9 @@ if [ -n "${EXTRA_ARGS:-}" ]; then
 fi
 
 [ -f "${MODEL_DIR}/config.json" ] || { say "FATAL: ${MODEL_DIR}/config.json missing"; ls -la "${MODEL_DIR}" | head; exit 1; }
-if [ -f /opt/glm53/patch_glm_video_placeholders.py ]; then
-    python3 /opt/glm53/patch_glm_video_placeholders.py
-fi
-if [ -f /opt/glm53/patch_suppress_stops_in_reasoning.py ]; then
-    python3 /opt/glm53/patch_suppress_stops_in_reasoning.py
-fi
-if [ -f /opt/glm53/patch_scheduler_decode_floor.py ]; then
-    python3 /opt/glm53/patch_scheduler_decode_floor.py
-fi
-if [ -f /opt/glm53/patch_glm5_drafter_group.py ]; then
-    python3 /opt/glm53/patch_glm5_drafter_group.py
-fi
-if [ -f /opt/glm53/patch_hybrid_prefix_hit.py ]; then
-    python3 /opt/glm53/patch_hybrid_prefix_hit.py
-fi
-if [ -f /opt/glm53/patch_xgrammar_termination.py ]; then
-    python3 /opt/glm53/patch_xgrammar_termination.py
-fi
-if [ -f /opt/glm53/patch_kpool_tail_slotmap.py ]; then
-    python3 /opt/glm53/patch_kpool_tail_slotmap.py
-fi
-if [ -f /opt/glm53/patch_spinwait.py ]; then
-    python3 /opt/glm53/patch_spinwait.py
-fi
-if [ -f /opt/glm53/patch_adaptive_k.py ]; then
-    python3 /opt/glm53/patch_adaptive_k.py
-fi
-if [ -f /opt/glm53/patch_dense_fp8.py ]; then
-    python3 /opt/glm53/patch_dense_fp8.py
-fi
-if [ -f /opt/glm53/patch_indexer_workspace.py ]; then
-    python3 /opt/glm53/patch_indexer_workspace.py
-fi
-if [ -f /opt/glm53/patch_ablit.py ]; then
-    python3 /opt/glm53/patch_ablit.py
-fi
+EOF
+    emit_overlay_block >> "$WORKER_SCRIPT"
+    cat >> "$WORKER_SCRIPT" <<'EOF'
 if [ "${ABLIT:-0}" = "1" ]; then
     say "ablit: o_proj orthogonalization ON (method=${ABLIT_METHOD:-auto} direction=${ABLIT_DIRECTION:-dealign} layers=${ABLIT_LAYERS:-15-45} alpha=${ABLIT_ALPHA:-3.0})"
 else
@@ -1208,6 +1339,12 @@ launch_cluster() {
     scp -q -o BatchMode=yes "$DRAFTER_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_glm5_drafter_group.py"
     [ -f "$APC_PATCH_HOST" ] || die "missing $APC_PATCH_HOST"
     scp -q -o BatchMode=yes "$APC_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_hybrid_prefix_hit.py"
+    [ -f "$PERGROUP_PATCH_HOST" ] || die "missing $PERGROUP_PATCH_HOST"
+    scp -q -o BatchMode=yes "$PERGROUP_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_apc_per_group_retention.py"
+    [ -f "$FINEHIT_PATCH_HOST" ] || die "missing $FINEHIT_PATCH_HOST"
+    scp -q -o BatchMode=yes "$FINEHIT_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_apc_fine_grained_hits.py"
+    [ -f "$DFLASH_DROP_PATCH_HOST" ] || die "missing $DFLASH_DROP_PATCH_HOST"
+    scp -q -o BatchMode=yes "$DFLASH_DROP_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_dflash_block_drop.py"
     [ -f "$XGRAMMAR_PATCH_HOST" ] || die "missing $XGRAMMAR_PATCH_HOST"
     scp -q -o BatchMode=yes "$XGRAMMAR_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_xgrammar_termination.py"
     [ -f "$KPOOL_TAIL_PATCH_HOST" ] || die "missing $KPOOL_TAIL_PATCH_HOST"
@@ -1258,7 +1395,15 @@ launch_cluster() {
         -e VLLM_NO_USAGE_STATS=1
         -e DO_NOT_TRACK=1
         -e "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=$CG_ESTIMATE"
+        -e VLLM_PREFIX_CACHE_RETENTION_INTERVAL
+        -e "GLM53_FINEGRAINED_APC=$GLM53_FINEGRAINED_APC"
     )
+    # Per-group APC retention for the EAGLE-exempt DFlash2 drafter SWA group
+    # (overlay/patch_apc_per_group_retention.py). Empty = auto (reachable
+    # boundaries only), 0 = boundaries only, N = multiple of the scheduler block.
+    if [ -n "${GLM53_APC_RETENTION_INTERVAL_SWA:-}" ]; then
+        nccl_common+=(-e "VLLM_PREFIX_CACHE_RETENTION_INTERVAL_SWA=$GLM53_APC_RETENTION_INTERVAL_SWA")
+    fi
     local worker_nccl="" e
     for e in "${nccl_common[@]}"; do
         [ "$e" = "-e" ] && continue
@@ -1314,6 +1459,9 @@ launch_cluster() {
         -v '/tmp/patch_scheduler_decode_floor.py:/opt/glm53/patch_scheduler_decode_floor.py:ro' \
         -v '/tmp/patch_glm5_drafter_group.py:/opt/glm53/patch_glm5_drafter_group.py:ro' \
         -v '/tmp/patch_hybrid_prefix_hit.py:/opt/glm53/patch_hybrid_prefix_hit.py:ro' \
+        -v '/tmp/patch_apc_per_group_retention.py:/opt/glm53/patch_apc_per_group_retention.py:ro' \
+        -v '/tmp/patch_apc_fine_grained_hits.py:/opt/glm53/patch_apc_fine_grained_hits.py:ro' \
+        -v '/tmp/patch_dflash_block_drop.py:/opt/glm53/patch_dflash_block_drop.py:ro' \
         -v '/tmp/patch_xgrammar_termination.py:/opt/glm53/patch_xgrammar_termination.py:ro' \
         -v '/tmp/patch_kpool_tail_slotmap.py:/opt/glm53/patch_kpool_tail_slotmap.py:ro' \
         -v '/tmp/patch_spinwait.py:/opt/glm53/patch_spinwait.py:ro' \
@@ -1349,6 +1497,9 @@ launch_cluster() {
         -v "$SCHED_PATCH_HOST:/opt/glm53/patch_scheduler_decode_floor.py:ro" \
         -v "$DRAFTER_PATCH_HOST:/opt/glm53/patch_glm5_drafter_group.py:ro" \
         -v "$APC_PATCH_HOST:/opt/glm53/patch_hybrid_prefix_hit.py:ro" \
+        -v "$PERGROUP_PATCH_HOST:/opt/glm53/patch_apc_per_group_retention.py:ro" \
+        -v "$FINEHIT_PATCH_HOST:/opt/glm53/patch_apc_fine_grained_hits.py:ro" \
+        -v "$DFLASH_DROP_PATCH_HOST:/opt/glm53/patch_dflash_block_drop.py:ro" \
         -v "$XGRAMMAR_PATCH_HOST:/opt/glm53/patch_xgrammar_termination.py:ro" \
         -v "$KPOOL_TAIL_PATCH_HOST:/opt/glm53/patch_kpool_tail_slotmap.py:ro" \
         -v "$SPINWAIT_PATCH_HOST:/opt/glm53/patch_spinwait.py:ro" \
@@ -1382,6 +1533,7 @@ launch_cluster() {
         -e SKIP_MM_PROFILING="$SKIP_MM_PROFILING" \
         -e LIMIT_MM="$LIMIT_MM" \
         -e CHAT_TEMPLATE="$CHAT_TEMPLATE" \
+        -e VLLM_PREFIX_CACHE_RETENTION_INTERVAL \
         -e ENFORCE_EAGER="$ENFORCE_EAGER" \
         -e EXL3_FUSED_MOE="$EXL3_FUSED_MOE" \
         -e EXL3_MOE_ROW_TILE="$EXL3_MOE_ROW_TILE" \
@@ -1604,7 +1756,7 @@ logs() {
 main() {
     local cmd="${1:-start}"
     case "$cmd" in
-        start|restart) validate_numeric_config ;;
+        start|restart) validate_numeric_config; validate_overlay_artifacts ;;
     esac
     case "$cmd" in
         stop)     banner stop.sh ;;
