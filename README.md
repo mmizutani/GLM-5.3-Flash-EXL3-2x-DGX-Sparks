@@ -110,8 +110,15 @@ Turn on (no rebuild; the patches apply at container start on both nodes):
 GLM53_ADAPTIVE_K=ema
 GLM53_ADAPTIVE_K_SET=2,4,7
 GLM53_DENSE_FP8=dense,kda            # drop this line to keep BF16 dense weights (lossless config)
-EXTRA_ARGS="--cudagraph-capture-sizes 1 2 3 4 5 6 8 9 10 12 15 16 20 24 32 --kv-cache-memory-bytes 15032385536"
+EXTRA_ARGS="--kv-cache-memory-bytes 15032385536"
 ```
+
+For DFlash with adaptive-k enabled (`ema`/`on`/`1`, case-insensitive, surrounding
+whitespace ignored), the launcher supplies the capture-size list automatically.
+It combines stock captures with multiples of the configured `GLM53_ADAPTIVE_K_SET`
+query lengths (`k + 1`, bounded by `DFLASH_TOKENS + 1`), including the full draft
+length, through `MAX_NUM_SEQS`. Explicit `--cudagraph-capture-sizes` in `EXTRA_ARGS`
+always wins; eager mode and non-DFlash capture defaults are unchanged.
 
 then `./start.sh restart`. The capture-size list is required for adaptive-k (multiples of 3, 5 and 8 up to 4 requests; the stock `1 2 4 8 16 24 32` misses the 3- and 5-token shapes). The KV cap turns FP8's freed GPU memory into host headroom instead of a bigger pool: uncapped, the head dropped to ~1.5 GiB MemAvailable at 850k. 14 GiB leaves an 883,552-token pool (1.04x of 850k) and ~5 GiB free; 15 GiB buys 1.11x but measured only 0.8-2.2 GiB free under load, which is not enough margin on this UMA. Do not go much lower at 850k either — the boot refuses a pool that cannot hold one max-length request (13 GiB is ~820k tokens). Verify after boot: `docker logs glm53-exl3-head | grep -a "adaptive-k\|dense fp8"` should show `uniform decode graph query lens: [3, 5, 8]` and `dense fp8 groups: dense,kda`, and with `ABLIT=1` the line `ABLIT_METHOD=auto -> transplant` (a missing `ablit/transplant/` silently falls back to the projection edit, which garbles sampled output). A running server can be retuned without a reboot through `~/.cache/vllm-glm53-flash/glm53_adaptive_k.json` (`{"mode":"ema","set":"2,4,7","margin":1.0}`; `{"mode":"off"}` restores k=7). Live sparkDash prose numbers with both on are in the table above.
 
@@ -130,6 +137,11 @@ python3 tests/bench_decode.py --phase structured --structured --runs 5 --max-tok
 # prose (hash-map explanation)
 python3 tests/bench_decode.py --phase prose --runs 5 --max-tokens 400 --skip-coherence --out /tmp/glm53-prose.json
 ```
+
+For keyed servers, export `VLLM_API_KEY` before running the decode benchmark.
+It sends Bearer auth on completion requests; a non-empty `API_KEY` takes
+precedence over `VLLM_API_KEY`. Unset or empty values fall through, and no
+header is sent when both are unset or empty. `/health` and `/metrics` stay keyless.
 
 ## E2 fat-expert prefill — [PR77](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks/pull/77) (2026-09-01)
 
@@ -195,7 +207,7 @@ same path as the compact-64 fp8 serve (not NVFP4 KV).
 | Tools / reasoning | `--tool-call-parser glm47 --enable-auto-tool-choice --reasoning-parser glm45` |
 | Graphs | on (`ENFORCE_EAGER=0`) — MTP capture `1 2 3 4 6 8 12`; DFlash2 capture `1 2 4 8 16 24 32` |
 | Spec | **DFlash2 k=7** (`incoai/GLM-5.3-Flash-DFlash2`); draft KV `auto`/bf16, draft TP=2, FLASH_ATTN. Rollback `SPEC_METHOD=mtp` |
-| Vision | on (`LANGUAGE_MODEL_ONLY=0`) — image + video, `--limit-mm-per-prompt {image:100,video:1}`, `--skip-mm-profiling` |
+| Vision | on (`LANGUAGE_MODEL_ONLY=0`) — image + video, `--limit-mm-per-prompt {image:48,video:1}`, `--mm-processor-kwargs {max_image_tokens:2048}`, `--mm-processor-cache-gb 1`, `--skip-mm-profiling` |
 | Ablit | **off** (`ABLIT=0`). Stock `o_proj`. Set `ABLIT=1` to enable; see [Abliteration](#abliteration-ablit1) |
 
 Kernels: `TORCH_CUDA_ARCH_LIST=12.1a`. ExLlamaV3 pin `c5d9c657` (0.0.43) exposes
@@ -377,11 +389,29 @@ logged tokens ≈ concurrency × that cap, and the hybrid floor then shrinks the
 pool.
 
 Keep **`SKIP_MM_PROFILING=1`** — a max-size image+video dummy profile OOMs this UMA.
-`LIMIT_MM={"image":100,"video":1}` is a validation ceiling only; nothing is reserved for
-it. The processor emits 16-8000 tokens per image, so the context window is the real
-limit and an over-long prompt is refused as too long. A prompt over the cap fails with
-HTTP 500 `At most N image(s) may be provided in one prompt`, which is why the default is
-generous rather than tight.
+The cost of that is permanent: **nothing is reserved for the vision tower**, so every
+multimodal token is encoded out of memory the model has already spent. `LIMIT_MM` is a
+validation ceiling only, and it has to be a ceiling this kit can actually encode.
+
+On **2026-09-14** it was not. An 11.9 MB video attached in a chat reached vLLM as ~33
+separate full-res *image* items — clients decompose video, and vLLM never splits one
+video into multiple encoder items. At the checkpoint's `max_image_tokens=8000` each
+frame cost ~7.2k tokens, the prompt reached **236,544 tokens** of vision encode, Node 0
+fell to **44 MB free**, and the kernel killed `VLLM::Worker_TP` (`EngineCore encountered
+a fatal error` → engine dead). File size is not the signal: 11.9 MB of H.264 is ~33
+decoded frames, and a frame costs the same as a full-page image.
+
+Three caps bound it, and all three are tunable:
+
+| knob | default | effect |
+|---|---|---|
+| `MM_IMAGE_TOKENS` | `2048` | per-image budget. A 1080p frame measures **2691** tokens uncapped, **2040** at 2048, **1008** at 1024. Also fixes a latent hazard: the checkpoint's 8000 exceeds `MAX_NUM_BATCHED_TOKENS=7168`, which is vLLM's encoder cache size, so a full-res image could not fit the cache. |
+| `LIMIT_MM` | `{"image":48,...}` | worst case 48 × 2048 = **98k** tokens, vs 800k before. Past the cap the API returns HTTP 500 `At most N image(s) may be provided in one prompt` — an error, not a dead engine. |
+| `MM_PROCESSOR_CACHE_GB` | `1` | vLLM holds 4 GiB of host RAM for processed media by default; on UMA that is 4 GiB the model cannot have. `0` disables it. |
+
+A 33-frame attachment now costs **67,320** tokens and serves. Raise `MM_IMAGE_TOKENS`
+toward 7168 if you need document-grade detail from single images, and watch
+`MemAvailable` on the head while you do.
 
 **NVFP4 KV is not available here.** FlashInfer’s SM12x NVFP4 kernels are dense MHA,
 not sparse MLA. Do not confuse that with NVFP4 **weights** (`--moe-backend marlin`).
@@ -604,11 +634,23 @@ word lands at char 39 of the prompt, so changing it is a full prefix-cache miss
 on an otherwise-warm conversation, not a partial one.
 `tests/test_chat_template.py` pins that shape.
 
-Needs: Docker (no sudo) on both nodes, python3 with Jinja2 on the head (verifies mounted inputs before `restart` stops anything), passwordless SSH head → worker,
+Needs: Docker (no sudo) on both nodes, python3 on the head plus a host Python with Jinja2 (verifies mounted inputs before `restart` stops anything), passwordless SSH head → worker,
 `hf` / `huggingface-cli` + `curl` + `rsync` on the head, ~180 GiB free per
 node for the first download. The GHCR image is public; login is only needed
 if you hit anonymous pull rate limits (`GHCR_TOKEN` + `GHCR_USER`).
 Mixed OS accounts: set `WORKER_USER` (this kit uses `zurih` on spark2).
+
+Chat-template validation tries `python3` from the caller's `PATH`, then
+`python3.12`, `python3.11`, and `/usr/bin/python3`, selecting the first that can
+import Jinja2. To pin the validator, set `GLM53_VALIDATE_PYTHON` to one executable
+name (resolved on `PATH`) or path, without command-line arguments; paths containing
+spaces are supported. When this variable is set, it is the **only** candidate:
+an empty value, missing/non-executable interpreter, or missing Jinja2 fails closed
+with exit status 2, without falling back. Unset it to restore automatic discovery.
+The selected interpreter must still parse the template successfully, with loop
+controls enabled; parse failures never trigger interpreter fallback. These failures
+abort `start`/`restart` before either rank is stopped. Python-overlay and JSON
+validation still use the caller's `python3`; this knob changes no other checks.
 
 NCCL cannot use the `10.0.0.x` loopback aliases — leave the CX7 pins unless
 your cabling differs. `ncclCommInitRank` hangs without them.
@@ -678,6 +720,7 @@ that are now documented/enforced:
 | `MAX_NUM_BATCHED_TOKENS` | `7168` | current maintainer default at `MAX_NUM_SEQS=4`. MNBT 2048 was the clean PR77 A/B configuration and the best measured balance on an independent `MAX_NUM_SEQS=16` geometry. Tune per deployment; change after a repeated same-kit comparison |
 | `MAX_MODEL_LEN` | `850000` | default context since 2026-09-07 (E3 default; 1M fits again with `EXL3_FAT_GROUPED=0`). 1M allocates on the 1.75M padded-slot-share pool. Do not drop to 256k to “free” KV — logged tokens ≈ concurrency × this cap; hybrid block-id overhead then shrinks the pool. At MNBT 7168 one 1M request needs **14.52 GiB** KV (10.98 GiB at 500k; ~7.4 GiB fixed + 7.1 GiB per 1M); the E3 recipe runs 500k |
 | `GPU_MEM_UTIL` | `0.85` | GB10 UMA budget (default lowered from 0.87 on 2026-09-07: each 0.01 is 1.2 GiB of host headroom, and long prefills need it — see *Cold prefill (E3)*). E3 at 900k / 0.85: pool ~1.05M tokens / 1.17× (0.87: 16.2 GiB / 1,051,648 tokens). Pre-E3 receipts at 1M / 0.87: 1,754,237 tokens / 18.67 GiB (MNBT 2048); 1,243,902 tokens / 1.24× (7168, rightsize, E2) |
+| `PYTORCH_CUDA_ALLOC_CONF` | `expandable_segments:True` when unset | TP=2 `start.sh` passes the effective value to both ranks. An explicit empty value disables this option; caller exports, including empty, override `.env`. Changing allocator settings requires a restart and separate memory/connector qualification; TP=4 is unchanged |
 | `KV_CACHE_DTYPE` | `fp8` | packed `fp8_ds_mla`; not `nvfp4`, not bf16 |
 | `GLM53_APC_RETENTION_INTERVAL_SWA` | *(unset)* | TP=2 DFlash2 drafter retention. Empty inherits global retention with ordinary priority; explicit `0` keeps reachable boundaries and enables draft-only eviction priority; positive values must be multiples of 3584, at most 1,000,000. Requires `SPEC_METHOD=dflash` and the hybrid prefix overlay. TP=4 rejects a non-empty value. Qualify retention, branching, and draft acceptance for the chosen global/SWA pair; see [measurements](docs/apc-retention-qualification.md) |
 | `GLM53_MIXED_PREFILL_CHUNK` | `skip` | do not mix a peer prefill into a decode step (issue #6). `N>0` = cap tokens; `0` = off. Solo prefill stays MNBT (7168) |
@@ -689,7 +732,10 @@ that are now documented/enforced:
 | `TRITON_HOST_CACHE` / `TILELANG_HOST_CACHE` | `$CACHE_ROOT/triton` / `tilelang` | persist JIT caches across container recreate |
 | `LANGUAGE_MODEL_ONLY` | `0` | load vision tower (image + video) |
 | `SKIP_MM_PROFILING` | `1` | skip max-size MM dummy at init (OOM otherwise) |
-| `LIMIT_MM` | `{"image":100,"video":1}` | `--limit-mm-per-prompt` (validation ceiling; nothing reserved) |
+| `LIMIT_MM` | `{"image":48,"video":1}` | `--limit-mm-per-prompt` (validation ceiling; nothing reserved) |
+| `MM_IMAGE_TOKENS` | `2048` | `--mm-processor-kwargs {"max_image_tokens":N}`; empty = checkpoint's 8000 |
+| `VIDEO_NUM_FRAMES` | (empty) | `--media-io-kwargs {"video":{"num_frames":N}}`; empty = vLLM's 32 |
+| `MM_PROCESSOR_CACHE_GB` | `1` | `--mm-processor-cache-gb` (vLLM default 4 GiB of host RAM) |
 | `HEAD_CX7_IF` / `WORKER_CX7_IF` | `enp1s0f1np1` / `enp1s0f0np0` | NCCL sockets |
 | `HEAD_CX7_IB` / `WORKER_CX7_IB` | `rocep1s0f1` / `rocep1s0f0` | NCCL HCAs |
 | `USE_HOST_NCCL` | `0` | image nvidia-nccl; host preload duplicates DeepEP |
